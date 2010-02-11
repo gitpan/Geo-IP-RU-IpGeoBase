@@ -1,0 +1,432 @@
+#!/usr/bin/env perl
+
+use 5.008;
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+my %db = (
+    dsn   => '',
+    user  => '',
+    pass  => '',
+    table => 'ip_geo_base_ru',
+);
+my %url = (
+    main        => 'http://ipgeobase.ru/files/db/Main/db_files.tar.gz',
+    coordinates => 'http://ipgeobase.ru/files/db/Map_db/block_coord.tar.gz',
+);
+my %opt = (
+    help        => 0,
+    create      => 0,
+    verbose     => 0,
+    split       => 0,
+);
+
+GetOptions(
+    'h|help!'              => \$opt{'help'},
+    'v|verbose!'           => \$opt{'verbose'},
+    'd|dsn=s'              => \$db{'dsn'},
+    'u|user=s'             => \$db{'user'},
+    'p|password=s'         => \$db{'pass'},
+    't|table=s'            => \$db{'table'},
+    'source=s'             => \$url{'main'},
+    'coordinates-source=s' => \$url{'coordinates'},
+    'create!'              => \$opt{'create'},
+    'split=i'              => \$opt{'split'},
+);
+
+if ( !$db{'dsn'} || $opt{'help'} ) {
+    require Pod::Usage;
+    Pod::Usage::pod2usage(
+        -message => "",
+        -exitval => $opt{'help'}? 0 : 1,
+        -verbose => 99,
+        -sections => $opt{'help'}? 'NAME|USAGE|DESCRIPTION|OPTIONS' : 'NAME|USAGE',
+    );
+}
+
+=head1 NAME
+
+ip-geo-base-ru - retrieve DBs from ipgeobase.ru and import them into DB
+
+=head1 USAGE
+
+    ip-geo-base-ru -h
+    ip-geo-base-ru --dsn 'dbi:SQLite:/path/to/my.db' --create
+    ip-geo-base-ru --dsn 'dbi:SQLite:/path/to/my.db'
+
+    ip-geo-base-ru [-d,--dsn <dsn>]
+        [-u,--user <db user>] [-p,--password <db password>]
+        [-t,--table <db table>] [--create]
+        [--source <URL>]
+        [--coordinates-source]
+
+=head1 DESCRIPTION
+
+Script fetches information about IP blocks and its locations from
+http://ipgeobase.ru and imports data into a database table.
+
+=head1 OPTIONS
+
+=over 4
+
+=item * -h, --help - show help and exit
+
+=item * -d, --dsn - the only mandatory option - data base connection
+string. Syntax described in L</DBI>, example 'dbi:mysql:mydb'.
+
+=item * -u, --user, -p, --password - credentials that should be
+used to connect to the DB. Default values are empty.
+
+=item * -t, --table - name of the table in the database where data
+should be stored, default value is 'ip_geo_base_ru'.
+
+=item * --create - use this to create table in the DB for the first
+time.
+
+=item * --source, --coordinates-source - URLs of the files on
+the site.
+
+=back
+
+=cut
+
+if ( $opt{'split'} ) {
+    my $t = 32 - $opt{'split'};
+    my $size = 1;
+    $size <<= 1 while $t-- > 0;
+    $opt{'split_size'} = $size;
+}
+
+require File::Spec;
+
+require Geo::IP::RU::IpGeoBase;
+my $api = Geo::IP::RU::IpGeoBase->new(
+    db => \%db,
+);
+if ( $opt{'create'} ) {
+    print "Going to create a table\n" if $opt{'verbose'};
+    $api->create_table;
+}
+
+my ($master, $slave, $coord) = fetch();
+
+my @equality_fields = qw(latitude longitude);
+my @master_fields = qw(istart iend block country city region federal_district master_line master_length);
+my @slave_fields  = qw(istart iend block country city region federal_district);
+my @coords_fields = qw(block istart iend city region federal_district latitude longitude);
+
+my $table = $api->db_info->{'quoted_table'};
+$api->dbh->do("UPDATE $table SET in_update = 1");
+process_leading($coord, \@coords_fields);
+process_suplimentary($master, \@master_fields);
+process_suplimentary($slave, \@slave_fields);
+$api->dbh->do("DELETE FROM $table WHERE in_update = 1");
+
+sub process_leading {
+    my ($file, $fields) = @_;
+    $api->process_file(
+        $file,
+        fields => $fields,
+        callback => \&update_stashing,
+    );
+    finalize_stash();
+    finalize_joining();
+}
+
+sub process_suplimentary { return; }
+
+{
+my ($proc_stash, $stash_start, $stash_end, @stash) = ();
+sub update_stashing {
+    my $rec = shift;
+    
+    unless ( @stash ) {
+        ($proc_stash, $stash_start, $stash_end, @stash)
+            = (0, $rec->{'istart'}, $rec->{'iend'}, $rec);
+        return;
+    }
+
+    if ( $rec->{'istart'} <= $stash_end
+        && $rec->{'iend'} >= $stash_start
+    ) {
+        $proc_stash = 1 if !$proc_stash
+            && !are_equal($stash[-1], $rec, \@equality_fields );
+        push @stash, $rec;
+        $stash_start = $rec->{'istart'} if $rec->{'istart'} < $stash_start;
+        $stash_end   = $rec->{'iend'}   if $rec->{'iend'}   > $stash_end;
+        return;
+    }
+
+    finalize_stash();
+
+    ($proc_stash, $stash_start, $stash_end, @stash)
+        = (0, $rec->{'istart'}, $rec->{'iend'}, $rec);
+}
+
+sub finalize_stash {
+    if ( @stash > 1 ) {
+        dump_stash("Resoving conflicts in:") if $opt{'verbose'};
+        if ( $proc_stash ) {
+            process_stash();
+            join_equal( \@stash, \@equality_fields );
+        } else {
+            join_all( \@stash, \@equality_fields );
+        }
+        dump_stash("Result:") if $opt{'verbose'};
+    }
+
+    update_joining( $_ ) foreach @stash;
+}
+
+sub process_stash {
+    sort_by_size( \@stash );
+
+    my @res = ();
+    while ( my $low = shift @stash ) {
+        my $i = 0;
+        while ( $i < @stash ) {
+            my $e = $stash[$i];
+            unless ( $e->{'istart'} <= $low->{'iend'}
+                && $e->{'iend'} >= $low->{'istart'}
+            ) {
+                $i++; next;
+            }
+
+            my @tmp = substract( $e, $low );
+            splice @stash, $i, 1, @tmp;
+            $i += @tmp;
+        }
+        push @res, $low;
+    }
+    sort_by_start( \@res );
+    @stash = @res;
+    return;
+}
+
+sub dump_stash {
+    print $_[0], "\n";
+    foreach (@stash) {
+        print join "\t", '', @{$_}{qw(start end city longitude)};
+        print "\n";
+    }
+} }
+
+{ my $cache;
+sub update_joining {
+    my $rec = shift;
+    unless ( $cache ) {
+        $cache = $rec;
+        return;
+    }
+
+    if ( $cache->{'istart'}-1 <= $rec->{'iend'}
+        && $cache->{'iend'}+1 >= $rec->{'istart'}
+        && are_equal( $cache, $rec, \@equality_fields )
+    ) {
+        if ( $cache->{'istart'} > $rec->{'istart'} ) {
+            $cache->{'start'}  = $rec->{'start'};
+            $cache->{'istart'} = $rec->{'istart'};
+        }
+        if ( $cache->{'iend'} < $rec->{'iend'} ) {
+            $cache->{'iend'} = $rec->{'iend'};
+            $cache->{'end'}  = $rec->{'end'};
+        }
+    }
+    else {
+        update_splitting($cache);
+        $cache = $rec;
+    }
+}
+sub finalize_joining {
+    update_splitting($cache);
+} }
+
+
+sub update_splitting {
+    my $rec = shift;
+
+    if ( $opt{'split'} && ($rec->{'iend'}-$rec->{'istart'}+1) > $opt{'split_size'} ) {
+        my $istart = $rec->{'istart'};
+        while ( $istart <= $rec->{'iend'} ) {
+            my $iend = $istart + $opt{'split_size'} - 1;
+            $iend = $rec->{'iend'} if $iend > $rec->{'iend'};
+            _process( {
+                %$rec,
+                istart => $istart, iend => $iend,
+                start => $api->int2ip($istart),
+                end => $api->int2ip($iend),
+            } );
+            $istart = $iend + 1;
+        }
+    }
+
+    update( $rec );
+}
+
+sub are_equal {
+    my ($left, $right, $fields) = @_;
+    foreach (@$fields) {
+        return 0 if $left->{$_} ne $right->{$_};
+    }
+    return 1;
+}
+
+sub join_equal {
+    my ($list, $fields) = @_;
+
+    my $i = 0;
+    while ( $i < (@$list - 1) ) {
+        unless ( are_equal( $list->[$i], $list->[$i+1], $fields ) ) {
+            $i++
+        } else {
+            $list->[$i]{'end'}  = $api->int2ip(
+                $list->[$i]{'iend'} = $list->[$i+1]{'iend'}
+            );
+            splice @$list, $i+1, 1;
+        }
+    }
+    return;
+}
+
+sub join_all {
+    my ($list) = @_;
+
+    my $max = 0;
+    foreach (@$list) {
+        $max = $_->{'iend'} if $max < $_->{'iend'};
+    }
+    $list->[0]{'end'} = $api->int2ip(
+        $list->[0]{'iend'} = $max
+    );
+    splice @$list, 1;
+}
+
+sub sort_by_size {
+    @{$_[0]} =
+        sort { $a->{'iend'}-$a->{'istart'} <=> $b->{'iend'}-$b->{'istart'} }
+        @{$_[0]};
+}
+
+sub sort_by_start {
+    @{$_[0]} = sort {$a->{'istart'} <=> $b->{'istart'}} @{$_[0]};
+}
+
+sub substract {
+    my ($from, $what) = @_;
+
+    if ( $what->{'istart'} <= $from->{'istart'} ) {
+        if ( $what->{'iend'} < $from->{'iend'} ) {
+            return {
+                %$from,
+                istart => $what->{'iend'}+1,
+                start => $api->int2ip( $what->{'iend'}+1 ),
+            };
+        } else {
+            return ();
+        }
+    }
+    elsif ( $what->{'iend'} >= $from->{'iend'} ) {
+        return {
+            %$from,
+            iend => $what->{'istart'}-1,
+            end => $api->int2ip( $what->{'istart'}-1 ),
+        };
+    } else {
+        return {
+            %$from,
+            iend => $what->{'istart'}-1,
+            end => $api->int2ip( $what->{'istart'}-1 ),
+        },
+        {
+            %$from,
+            istart => $what->{'iend'}+1,
+            start => $api->int2ip( $what->{'iend'}+1 ),
+        };
+    }
+}
+
+sub update {
+    my $rec = shift;
+
+    if ( $opt{'create'} ) {
+        print "Inserting block $rec->{start} - $rec->{end} ($rec->{city}, $rec->{longitude})\n" if $opt{'verbose'};
+        return $api->insert_record( %$rec, in_update => 0 );
+    }
+    elsif ( $api->fetch_record( $rec->{'istart'}, $rec->{'iend'} ) ) {
+        print "Updating block $rec->{start} - $rec->{end}  ($rec->{city}, $rec->{longitude})\n" if $opt{'verbose'};
+        return $api->update_record( %$rec, in_update => 0 );
+    }
+    else {
+        print "Inserting block $rec->{start} - $rec->{end} ($rec->{city}, $rec->{longitude})\n" if $opt{'verbose'};
+        return $api->insert_record( %$rec, in_update => 0 );
+    }
+}
+
+
+exit 0;
+
+sub fetch {
+    my @files = extract( fetch_file( $url{'main'} ) );
+    unless ( grep $_ eq 'cidr_ru_master_index.db', @files ) {
+        die "Couldn't find slave DB";
+    }
+    unless ( grep $_ eq 'cidr_ru_slave_index.db', @files ) {
+        die "Couldn't find slave DB";
+    }
+    my $master = File::Spec->catfile( tmp_dir(), 'cidr_ru_master_index.db' );
+    my $slave = File::Spec->catfile( tmp_dir(), 'cidr_ru_slave_index.db' );
+
+    @files = extract( fetch_file( $url{'coordinates'} ) );
+    unless ( grep $_ eq 'block_coord.db', @files ) {
+        die "Couldn't find coordinates file";
+    }
+    my $coord = File::Spec->catfile( tmp_dir(), 'block_coord.db' );
+    return ($master, $slave, $coord);
+}
+
+sub extract {
+    my $file = shift;
+
+    print "Going to extract archive '$file'\n" if $opt{'verbose'};
+
+    require Archive::Extract;
+    my $ae = Archive::Extract->new( archive => $file );
+    return $file unless $ae;
+    $ae->extract( to => tmp_dir() ) or die $ae->error;
+
+    print "Done\n" if $opt{'verbose'};
+
+    return @{ $ae->files };
+}
+
+sub fetch_file {
+    my $url = shift;
+
+    my ($file) = ($url =~ m{/([^/]+)$});
+    die "couldn't figure file name from $url" unless $file;
+
+    my $path = File::Spec->catfile( tmp_dir(), $file );
+
+    print "Going to fetch '$url'\n" if $opt{'verbose'};
+    require LWP::Simple;
+    my $status = LWP::Simple::getstore($url, $path);
+    die "Couldn't get '$url': $status"
+        unless $status == 200;
+
+    print "Fetched to '$path'\n" if $opt{'verbose'};
+    return $path;
+}
+
+my $tmp_dir;
+sub tmp_dir {
+    return $tmp_dir if $tmp_dir;
+
+    require File::Temp;
+    $tmp_dir = File::Temp->newdir( CLEANUP => 1 );
+    print "Temporary directory is '$tmp_dir'\n" if $opt{'verbose'};
+
+    return $tmp_dir;
+}
+
